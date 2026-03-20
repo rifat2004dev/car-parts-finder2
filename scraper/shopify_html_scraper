@@ -1,0 +1,110 @@
+from __future__ import annotations
+
+from urllib.parse import quote_plus, urljoin
+
+from bs4 import Tag
+
+from config import MAX_PAGES_PER_SOURCE
+from models import Listing
+from scraper.base import BaseScraper
+from utils import contains_query_keyword, extract_price, infer_car_model, is_http_url, polite_delay, query_variants
+
+
+class ShopifyHtmlScraper(BaseScraper):
+    base_url: str = ''
+    human_source: str = ''
+    location_hint: str = 'Delivery to Western Cape'
+
+    def _search_urls(self, variant: str) -> list[str]:
+        return [
+            f'{self.base_url}/search?q={quote_plus(variant)}&type=product',
+            f'{self.base_url}/search?q={quote_plus(variant)}',
+        ]
+
+    def _extract_title(self, container: Tag) -> str:
+        for selector in [
+            'h1', 'h2', 'h3', 'h4', '.card__heading', '.product-title', '.card-title',
+            '.title', '[data-predictive-search-product-title]',
+        ]:
+            node = container.select_one(selector)
+            if node:
+                text = node.get_text(' ', strip=True)
+                if text:
+                    return text
+        for anchor in container.select('a[href]'):
+            text = anchor.get_text(' ', strip=True)
+            if len(text) >= 6:
+                return text
+        return ''
+
+    def _extract_price(self, container: Tag) -> str | None:
+        for selector in [
+            '.price', '.price-item', '.money', '[data-product-price]', '.product-price', '.card-information'
+        ]:
+            node = container.select_one(selector)
+            if node:
+                price = extract_price(node.get_text(' ', strip=True))
+                if price:
+                    return price
+        return extract_price(container.get_text(' ', strip=True))
+
+    def _iter_candidate_containers(self, soup) -> list[Tag]:
+        selectors = [
+            'li.grid__item', 'product-card', '.card-wrapper', '.product-grid-item',
+            '.grid-product', '.boost-pfs-filter-product-item', '.product-item',
+            'li.product', 'article.product', '.search-result', 'div[class*="product"]',
+        ]
+        containers: list[Tag] = []
+        for selector in selectors:
+            containers.extend([c for c in soup.select(selector) if isinstance(c, Tag)])
+        if not containers:
+            containers = [a.find_parent(['div', 'li', 'article']) or a for a in soup.select('a[href]')]
+        return containers
+
+    def scrape(self) -> list[Listing]:
+        listings: list[Listing] = []
+        seen_urls: set[str] = set()
+
+        for variant in query_variants(self.query):
+            page_hits = 0
+            for search_url in self._search_urls(variant)[:MAX_PAGES_PER_SOURCE]:
+                response = self.get(search_url)
+                soup = self.soup(response.text)
+                page_results = 0
+                for container in self._iter_candidate_containers(soup):
+                    href = ''
+                    for anchor in container.select('a[href]'):
+                        candidate = urljoin(self.base_url, anchor.get('href', '').strip())
+                        if not is_http_url(candidate):
+                            continue
+                        if '/products/' not in candidate and '/collections/' not in candidate:
+                            continue
+                        if '/search' in candidate:
+                            continue
+                        href = candidate
+                        break
+                    if not href or href in seen_urls:
+                        continue
+
+                    title = self._extract_title(container)
+                    if not title or not contains_query_keyword(title, self.query):
+                        continue
+
+                    listings.append(
+                        Listing.create(
+                            search_query=self.query,
+                            part_name=title,
+                            car_model=infer_car_model(title, self.query),
+                            price=self._extract_price(container),
+                            location=self.location_hint,
+                            source=self.human_source,
+                            url=href,
+                        )
+                    )
+                    seen_urls.add(href)
+                    page_results += 1
+                page_hits += page_results
+                polite_delay()
+            if page_hits:
+                break
+        return listings

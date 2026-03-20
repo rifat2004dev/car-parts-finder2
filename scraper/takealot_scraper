@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import json
+import re
+from urllib.parse import quote_plus, urljoin
+
+from models import Listing
+from scraper.base import BaseScraper
+from utils import contains_query_keyword, extract_price, infer_car_model, is_http_url, polite_delay, query_variants
+
+
+class TakealotScraper(BaseScraper):
+    source_name = 'takealot'
+    base_url = 'https://www.takealot.com'
+    state_re = re.compile(r'window\.__PRELOADED_STATE__\s*=\s*(\{.*?\})\s*;\s*</script>', re.S)
+
+    def scrape(self) -> list[Listing]:
+        listings: list[Listing] = []
+        seen: set[str] = set()
+
+        for variant in query_variants(self.query):
+            url = f'{self.base_url}/all?qsearch={quote_plus(variant)}'
+            response = self.get(url)
+            html = response.text
+
+            # Primary strategy: structured state blob embedded in page HTML.
+            match = self.state_re.search(html)
+            if match:
+                try:
+                    state = json.loads(match.group(1))
+                    for key, value in state.items():
+                        if not isinstance(value, dict):
+                            continue
+                        title = str(value.get('title') or value.get('name') or '').strip()
+                        href = str(value.get('uri') or value.get('slug') or value.get('url') or '').strip()
+                        if not title or not href:
+                            continue
+                        href = urljoin(self.base_url, href)
+                        if href in seen or not is_http_url(href) or not contains_query_keyword(title, self.query):
+                            continue
+                        price = None
+                        for pkey in ['sale_price', 'price', 'selling_price', 'display_price']:
+                            pval = value.get(pkey)
+                            if pval:
+                                price = f'R{pval}' if str(pval).replace('.', '', 1).isdigit() else str(pval)
+                                break
+                        listings.append(
+                            Listing.create(
+                                search_query=self.query,
+                                part_name=title,
+                                car_model=infer_car_model(title, self.query),
+                                price=price,
+                                location='Delivery to Western Cape',
+                                source='Takealot',
+                                url=href,
+                            )
+                        )
+                        seen.add(href)
+                except Exception:
+                    pass
+
+            # Fallback strategy: plain anchors/cards in the HTML.
+            soup = self.soup(html)
+            cards = soup.select('a[href*="/p/"]') or soup.select('a[href]')
+            for anchor in cards:
+                href = urljoin(self.base_url, anchor.get('href', '').strip())
+                title = anchor.get_text(' ', strip=True)
+                if not title or not href or href in seen or not is_http_url(href):
+                    continue
+                if '/p/' not in href and '/product/' not in href:
+                    continue
+                if not contains_query_keyword(title, self.query):
+                    continue
+                parent = anchor.find_parent(['div', 'article', 'li']) or anchor.parent
+                price = extract_price(parent.get_text(' ', strip=True) if parent else title)
+                listings.append(
+                    Listing.create(
+                        search_query=self.query,
+                        part_name=title,
+                        car_model=infer_car_model(title, self.query),
+                        price=price,
+                        location='Delivery to Western Cape',
+                        source='Takealot',
+                        url=href,
+                    )
+                )
+                seen.add(href)
+            if listings:
+                break
+            polite_delay()
+        return listings

@@ -1,0 +1,10 @@
+from __future__ import annotations
+
+from scraper.shopify_html_scraper import ShopifyHtmlScraper
+
+
+class ModernAutoPartsScraper(ShopifyHtmlScraper):
+    source_name = 'modern_auto_parts'
+    base_url = 'https://modernautoparts.co.za'
+    human_source = 'Modern Auto Parts'
+    location_hint = 'Salt River, Cape Town / Delivery to Western Cape'
